@@ -40,3 +40,4 @@ jobs:
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           verbose: true
+          repository-url: https://upload.pypi.org/legacy/
