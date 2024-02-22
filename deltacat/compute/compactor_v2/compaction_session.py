@@ -9,6 +9,9 @@ import json
 from deltacat.aws import s3u as s3_utils
 import deltacat
 from deltacat import logs
+from deltacat.storage import (
+    DeltaType,
+)
 from deltacat.compute.compactor import (
     PyArrowWriteResult,
     RoundCompletionInfo,
@@ -18,6 +21,7 @@ from deltacat.compute.compactor_v2.model.merge_result import MergeResult
 from deltacat.compute.compactor_v2.model.hash_bucket_input import HashBucketInput
 from deltacat.compute.compactor_v2.model.hash_bucket_result import HashBucketResult
 from deltacat.compute.compactor.model.materialize_result import MaterializeResult
+from deltacat.compute.compactor_v2.model.prepare_delete_input import PrepareDeleteInput
 from deltacat.storage import (
     Delta,
     DeltaLocator,
@@ -32,6 +36,7 @@ from deltacat.utils.ray_utils.concurrency import (
 )
 from deltacat.compute.compactor_v2.steps import merge as mg
 from deltacat.compute.compactor_v2.steps import hash_bucket as hb
+from deltacat.compute.compactor_v2.steps import prepare_delete as pd
 from deltacat.compute.compactor_v2.utils import io
 from deltacat.compute.compactor.utils import round_completion_file as rcf
 
@@ -210,6 +215,43 @@ def _execute_compaction(
         logger.info("No input deltas found to compact.")
         return None, None, None
 
+    delete_spos_to_obj_ref = defaultdict()
+    window_start, window_end = 0, 0
+    while window_end < len(uniform_deltas):
+        annotated_delta = uniform_deltas[window_end]
+        annotations = annotated_delta.annotations
+        annotation_delta_type = annotations[0].annotation_delta_type
+        if annotation_delta_type is DeltaType.UPSERT:
+            window_end += 1
+            continue
+        while (
+            window_end < len(uniform_deltas)
+            and uniform_deltas[window_end].annotations[0].annotation_delta_type
+            is DeltaType.DELETE
+        ):
+            # window_end will be 1 greater than last delete_index
+            window_end += 1
+        deltas_to_pass = uniform_deltas[window_start:window_end]
+        for i, delta in enumerate(deltas_to_pass):
+            logger.info(
+                f"pdebug:compaction_session:[{window_start=}][{window_end=}]:{i}:{delta.annotations[0].annotation_delta_type}"
+            )
+        obj_ref, delete_spos = pd.prepare_delete(
+            PrepareDeleteInput.of(
+                annotated_deltas=deltas_to_pass,
+                read_kwargs_provider=params.read_kwargs_provider,
+                deltacat_storage=params.deltacat_storage,
+                deltacat_storage_kwargs=params.deltacat_storage_kwargs,
+                round_completion_info=round_completion_info,
+                delete_columns=["col_1"],
+                primary_keys=params.primary_keys,
+            )
+        )
+        for delete_spo in delete_spos:
+            delete_spos_to_obj_ref[delete_spo] = obj_ref
+        window_start = window_end
+        window_end += 1
+
     hb_options_provider = functools.partial(
         task_resource_options_provider,
         pg_config=params.pg_config,
@@ -227,7 +269,6 @@ def _execute_compaction(
             "input": HashBucketInput.of(
                 item,
                 primary_keys=params.primary_keys,
-                hb_task_index=index,
                 num_hash_buckets=params.hash_bucket_count,
                 num_hash_groups=params.hash_group_count,
                 enable_profiler=params.enable_profiler,
@@ -364,6 +405,7 @@ def _execute_compaction(
                 object_store=params.object_store,
                 deltacat_storage=params.deltacat_storage,
                 deltacat_storage_kwargs=params.deltacat_storage_kwargs,
+                spos_to_obj_ref=delete_spos_to_obj_ref,
             )
         }
 
