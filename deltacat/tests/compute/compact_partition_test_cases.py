@@ -1422,6 +1422,11 @@ REBASE_THEN_INCREMENTAL_TEST_CASES = {
         drop_duplicates=True,
         skip_enabled_compact_partition_drivers=[CompactorVersion.V1],
     ),
+    # test cases
+    # UDU
+    # UDDDDU
+    # DD
+    # UDUD - two delete columns
 }
 
 INCREMENTAL_TEST_CASES = with_compactor_version_func_test_param(INCREMENTAL_TEST_CASES)
