@@ -17,7 +17,11 @@ from deltacat.compute.compactor_v2.model.merge_input import MergeInput
 from deltacat.aws import s3u as s3_utils
 import deltacat
 from deltacat import logs
-from deltacat.compute.compactor import PyArrowWriteResult, RoundCompletionInfo
+from deltacat.compute.compactor import (
+    HighWatermark,
+    PyArrowWriteResult,
+    RoundCompletionInfo,
+)
 from deltacat.compute.compactor_v2.model.merge_result import MergeResult
 from deltacat.compute.compactor_v2.model.hash_bucket_result import HashBucketResult
 from deltacat.compute.compactor.model.materialize_result import MaterializeResult
@@ -37,6 +41,7 @@ from deltacat.compute.compactor_v2.deletes.utils import prepare_deletes
 from deltacat.storage import (
     Delta,
     DeltaLocator,
+    Manifest,
     Partition,
 )
 from deltacat.compute.compactor.model.compact_partition_params import (
@@ -50,6 +55,7 @@ from deltacat.compute.compactor_v2.steps import merge as mg
 from deltacat.compute.compactor_v2.steps import hash_bucket as hb
 from deltacat.compute.compactor_v2.utils import io
 from deltacat.compute.compactor.utils import round_completion_file as rcf
+from deltacat.utils.metrics import metrics
 
 from typing import List, Optional, Tuple
 from collections import defaultdict
@@ -62,6 +68,7 @@ from deltacat.utils.resources import (
 from deltacat.compute.compactor_v2.utils.task_options import (
     hash_bucket_resource_options_provider,
     merge_resource_options_provider,
+    local_merge_resource_options_provider,
 )
 from deltacat.compute.compactor.model.compactor_version import CompactorVersion
 
@@ -72,6 +79,7 @@ if importlib.util.find_spec("memray"):
 logger = logs.configure_deltacat_logger(logging.getLogger(__name__))
 
 
+@metrics
 def compact_partition(params: CompactPartitionParams, **kwargs) -> Optional[str]:
 
     assert (
@@ -93,7 +101,7 @@ def compact_partition(params: CompactPartitionParams, **kwargs) -> Optional[str]
         round_completion_file_s3_url = None
         if new_partition:
             logger.info(f"Committing compacted partition to: {new_partition.locator}")
-            partition = params.deltacat_storage.commit_partition(
+            partition: Partition = params.deltacat_storage.commit_partition(
                 new_partition, **params.deltacat_storage_kwargs
             )
             logger.info(f"Committed compacted partition: {partition}")
@@ -147,9 +155,9 @@ def _execute_compaction(
         compaction_audit.set_total_cluster_memory_bytes(cluster_memory)
 
     # read the results from any previously completed compaction round
-    round_completion_info = None
-    high_watermark = None
-    previous_compacted_delta_manifest = None
+    round_completion_info: Optional[RoundCompletionInfo] = None
+    high_watermark: Optional[HighWatermark] = None
+    previous_compacted_delta_manifest: Optional[Manifest] = None
 
     if not params.rebase_source_partition_locator:
         round_completion_info = rcf.read_round_completion_file(
@@ -258,14 +266,17 @@ def _execute_compaction(
         resource_amount_provider=hash_bucket_resource_options_provider,
         previous_inflation=params.previous_inflation,
         average_record_size_bytes=params.average_record_size_bytes,
+        total_memory_buffer_percentage=params.total_memory_buffer_percentage,
         primary_keys=params.primary_keys,
         ray_custom_resources=params.ray_custom_resources,
+        memory_logs_enabled=params.memory_logs_enabled,
     )
 
     total_input_records_count = np.int64(0)
     total_hb_record_count = np.int64(0)
     telemetry_time_hb = 0
     if params.hash_bucket_count == 1:
+        logger.info("Hash bucket count set to 1. Running local merge")
         merge_start = time.monotonic()
         local_merge_input = generate_local_merge_input(
             params,
@@ -275,7 +286,29 @@ def _execute_compaction(
             delete_strategy,
             delete_file_envelopes,
         )
-        local_merge_result = ray.get(mg.merge.remote(local_merge_input))
+        estimated_da_bytes = (
+            compaction_audit.estimated_in_memory_size_bytes_during_discovery
+        )
+        estimated_num_records = sum(
+            [
+                entry.meta.record_count
+                for delta in uniform_deltas
+                for entry in delta.manifest.entries
+            ]
+        )
+        local_merge_options = local_merge_resource_options_provider(
+            estimated_da_size=estimated_da_bytes,
+            estimated_num_rows=estimated_num_records,
+            total_memory_buffer_percentage=params.total_memory_buffer_percentage,
+            round_completion_info=round_completion_info,
+            compacted_delta_manifest=previous_compacted_delta_manifest,
+            ray_custom_resources=params.ray_custom_resources,
+            primary_keys=params.primary_keys,
+            memory_logs_enabled=params.memory_logs_enabled,
+        )
+        local_merge_result = ray.get(
+            mg.merge.options(**local_merge_options).remote(local_merge_input)
+        )
         total_input_records_count += local_merge_result.input_record_count
         merge_results = [local_merge_result]
         merge_invoke_end = time.monotonic()
@@ -296,6 +329,7 @@ def _execute_compaction(
                     object_store=params.object_store,
                     deltacat_storage=params.deltacat_storage,
                     deltacat_storage_kwargs=params.deltacat_storage_kwargs,
+                    memory_logs_enabled=params.memory_logs_enabled,
                 )
             }
 
@@ -382,12 +416,14 @@ def _execute_compaction(
             num_hash_groups=params.hash_group_count,
             hash_group_size_bytes=all_hash_group_idx_to_size_bytes,
             hash_group_num_rows=all_hash_group_idx_to_num_rows,
+            total_memory_buffer_percentage=params.total_memory_buffer_percentage,
             round_completion_info=round_completion_info,
             compacted_delta_manifest=previous_compacted_delta_manifest,
             primary_keys=params.primary_keys,
             deltacat_storage=params.deltacat_storage,
             deltacat_storage_kwargs=params.deltacat_storage_kwargs,
             ray_custom_resources=params.ray_custom_resources,
+            memory_logs_enabled=params.memory_logs_enabled,
         )
 
         def merge_input_provider(index, item):
@@ -417,6 +453,7 @@ def _execute_compaction(
                     deltacat_storage_kwargs=params.deltacat_storage_kwargs,
                     delete_strategy=delete_strategy,
                     delete_file_envelopes=delete_file_envelopes,
+                    memory_logs_enabled=params.memory_logs_enabled,
                 )
             }
 
@@ -438,11 +475,11 @@ def _execute_compaction(
     merge_end = time.monotonic()
 
     total_dd_record_count = sum([ddr.deduped_record_count for ddr in merge_results])
-    total_dropped_record_count = sum(
+    total_deleted_record_count = sum(
         [ddr.deleted_record_count for ddr in merge_results]
     )
     logger.info(
-        f"Deduped {total_dd_record_count} records and dropped {total_dropped_record_count} records..."
+        f"Deduped {total_dd_record_count} records and deleted {total_deleted_record_count} records..."
     )
 
     compaction_audit.set_input_records(total_input_records_count.item())
@@ -456,7 +493,7 @@ def _execute_compaction(
     )
 
     compaction_audit.set_records_deduped(total_dd_record_count.item())
-
+    compaction_audit.set_records_deleted(total_deleted_record_count.item())
     mat_results = []
     for merge_result in merge_results:
         mat_results.extend(merge_result.materialize_results)
@@ -503,7 +540,7 @@ def _execute_compaction(
     record_info_msg = (
         f"Hash bucket records: {total_hb_record_count},"
         f" Deduped records: {total_dd_record_count}, "
-        f" Dropped records: {total_dropped_record_count}, "
+        f" Deleted records: {total_deleted_record_count}, "
         f" Materialized records: {merged_delta.meta.record_count}"
     )
     logger.info(record_info_msg)
@@ -603,7 +640,19 @@ def _execute_compaction(
         f"partition-{params.source_partition_locator.partition_values},"
         f"compacted at: {params.last_stream_position_to_compact},"
     )
-
+    is_inplace_compacted: bool = (
+        params.source_partition_locator.partition_values
+        == params.destination_partition_locator.partition_values
+        and params.source_partition_locator.stream_id
+        == params.destination_partition_locator.stream_id
+    )
+    if is_inplace_compacted:
+        logger.info(
+            "Overriding round completion file source partition locator as in-place compacted. "
+            + f"Got compacted partition partition_id of {compacted_partition.locator.partition_id} "
+            f"and rcf source partition_id of {rcf_source_partition_locator.partition_id}."
+        )
+        rcf_source_partition_locator = compacted_partition.locator
     return (
         compacted_partition,
         new_round_completion_info,
